@@ -38,8 +38,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # NovaTech backend URL — the source of live traffic predictions.
 # Override via env var when running on Render or changing the port.
-# ---------------------------------------------------------------------------
-NOVATECH_URL = os.getenv("NOVATECH_URL", "http://127.0.0.1:8001")
+NOVATECH_URL = os.getenv("NOVATECH_URL", "https://novatech-backend-hih9.onrender.com")
 
 # In-memory history for live captured flow predictions
 MAX_HISTORY = 500
@@ -65,7 +64,7 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 _raw_origins = os.getenv(
     "ALLOWED_ORIGINS",
-    "http://localhost:5173,http://127.0.0.1:5173"
+    "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000,http://127.0.0.1:8000,http://localhost:8001,http://127.0.0.1:8001,http://localhost:3000,http://127.0.0.1:3000,https://novatech-backend-hih9.onrender.com,https://novatech-frontend-owz2.onrender.com"
 )
 ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 logger.info(f"CORS allowed origins: {ALLOWED_ORIGINS}")
@@ -73,7 +72,7 @@ logger.info(f"CORS allowed origins: {ALLOWED_ORIGINS}")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"https://.*\.onrender\.com",
+    allow_origin_regex=r"(https://.*\.onrender\.com|http://(localhost|127\.0\.0\.1)(:\d+)?)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -408,48 +407,90 @@ async def recent_predictions(limit: int = 50):
 # Live HTTP Traffic Events (NovaTech integration)
 # ---------------------------------------------------------------------------
 
+def _normalize_event(data: dict[str, Any]) -> dict[str, Any]:
+    raw_status = data.get("status_code")
+    try:
+        status_code = int(raw_status) if raw_status is not None else 200
+    except (ValueError, TypeError):
+        status_code = 200
+
+    raw_resp_time = data.get("response_time_ms")
+    try:
+        response_time_ms = float(raw_resp_time) if raw_resp_time is not None else 0.0
+    except (ValueError, TypeError):
+        response_time_ms = 0.0
+
+    return {
+        "id": str(data.get("id") or uuid.uuid4()),
+        "timestamp": str(data.get("timestamp") or datetime.now(timezone.utc).isoformat()),
+        "method": str(data.get("method", "GET")).upper(),
+        "path": str(data.get("path", "/")),
+        "query": data.get("query"),
+        "client_ip": str(data.get("client_ip", "unknown")),
+        "user_agent": str(data.get("user_agent", "unknown")),
+        "status_code": status_code,
+        "response_time_ms": response_time_ms,
+    }
+
+
 @app.post("/api/traffic-events", tags=["Traffic Events"])
 async def ingest_traffic_event(request: Request):
     """
     Accepts genuine HTTP metadata events from the NovaTech test website:
     id, timestamp, method, path, query, client_ip, user_agent, status_code, response_time_ms.
     Stores the event in thread-safe in-memory deque (last 500 events).
+    Supports single JSON object or a JSON array of events.
     """
     try:
         data = await request.json()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
 
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=400, detail="Expected a JSON object")
-
-    event = {
-        "id": str(data.get("id") or uuid.uuid4()),
-        "timestamp": str(data.get("timestamp") or datetime.now(timezone.utc).isoformat()),
-        "method": str(data.get("method", "GET")),
-        "path": str(data.get("path", "/")),
-        "query": data.get("query"),
-        "client_ip": str(data.get("client_ip", "unknown")),
-        "user_agent": str(data.get("user_agent", "unknown")),
-        "status_code": int(data.get("status_code", 200)),
-        "response_time_ms": float(data.get("response_time_ms", 0.0)),
-    }
-
-    TRAFFIC_EVENTS.append(event)
-    logger.info(
-        f"HTTP Traffic Event: {event['method']} {event['path']} "
-        f"[{event['status_code']}] {event['response_time_ms']}ms ({event['client_ip']})"
-    )
-
-    return JSONResponse(content={"status": "ok", "message": "Event recorded", "id": event["id"]})
+    if isinstance(data, list):
+        added = []
+        for item in data:
+            if isinstance(item, dict):
+                evt = _normalize_event(item)
+                TRAFFIC_EVENTS.append(evt)
+                added.append(evt["id"])
+        logger.info(f"Recorded batch of {len(added)} HTTP traffic events")
+        return JSONResponse(content={"status": "ok", "message": f"{len(added)} events recorded", "ids": added})
+    elif isinstance(data, dict):
+        evt = _normalize_event(data)
+        TRAFFIC_EVENTS.append(evt)
+        logger.info(
+            f"HTTP Traffic Event: {evt['method']} {evt['path']} "
+            f"[{evt['status_code']}] {evt['response_time_ms']}ms ({evt['client_ip']})"
+        )
+        return JSONResponse(content={"status": "ok", "message": "Event recorded", "id": evt["id"]})
+    else:
+        raise HTTPException(status_code=400, detail="Expected a JSON object or array")
 
 
 @app.get("/api/traffic-events", tags=["Traffic Events"])
 async def get_traffic_events(limit: int = 50):
     """
     Returns the most recent HTTP traffic events stored in memory.
+    If the store is empty, attempts to populate from NovaTech backend if configured.
     """
     limit = max(1, min(limit, 500))
+
+    if len(TRAFFIC_EVENTS) == 0 and NOVATECH_URL:
+        url = f"{NOVATECH_URL.rstrip('/')}/api/request-log"
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.get(url, params={"limit": limit})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    entries = data.get("entries") or []
+                    for item in entries:
+                        if isinstance(item, dict):
+                            evt = _normalize_event(item)
+                            if not any(e.get("id") == evt["id"] for e in TRAFFIC_EVENTS):
+                                TRAFFIC_EVENTS.append(evt)
+        except Exception as exc:
+            logger.debug(f"Could not backfill traffic events from NovaTech: {exc}")
+
     events = list(TRAFFIC_EVENTS)[-limit:]
     # Return newest events first for clean display in the live table
     events.reverse()

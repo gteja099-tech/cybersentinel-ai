@@ -15,13 +15,14 @@ const COLORS = [
 const POLL_INTERVAL_MS = 3000;
 
 /* ── Derive dashboard stats from ML predictions and live HTTP traffic ── */
-function buildDashboardData(predictions, trafficEvents) {
+function buildDashboardData(predictions, trafficEvents, trafficTotal = 0) {
   const hasML = Array.isArray(predictions) && predictions.length > 0;
-  const hasHTTP = Array.isArray(trafficEvents) && trafficEvents.length > 0;
+  const count = Math.max(trafficTotal, Array.isArray(trafficEvents) ? trafficEvents.length : 0);
+  const hasHTTP = count > 0;
 
   // 1. Total Traffic Analyzed: uses the count of live HTTP traffic events from /api/traffic-events
   const totalTraffic = hasHTTP
-    ? trafficEvents.length.toLocaleString()
+    ? count.toLocaleString()
     : 'Waiting for live traffic...';
 
   // 2. Attacks Detected: continues using only ML predictions (/api/recent-predictions)
@@ -30,9 +31,7 @@ function buildDashboardData(predictions, trafficEvents) {
     : [];
   const attacksDetected = hasML
     ? attacks.length.toLocaleString()
-    : hasHTTP
-    ? '0'
-    : 'Waiting for live traffic...';
+    : '0';
 
   // 3. Current Risk: continues using only ML predictions (do not infer from HTTP events)
   const hasHigh = hasML && predictions.some((p) => (p.risk || '').toUpperCase() === 'HIGH');
@@ -43,9 +42,7 @@ function buildDashboardData(predictions, trafficEvents) {
       : hasMedium
       ? 'MEDIUM'
       : 'LOW'
-    : hasHTTP
-    ? 'NO ML DATA'
-    : '—';
+    : 'NO ML DATA';
 
   // 4. Model Confidence: continues using only ML predictions
   let modelConfidence = 'N/A';
@@ -101,6 +98,7 @@ function buildDashboardData(predictions, trafficEvents) {
 export default function Dashboard() {
   const [predictions, setPredictions]     = useState([]);
   const [trafficEvents, setTrafficEvents] = useState([]);
+  const [trafficTotal, setTrafficTotal]   = useState(0);
   const [fetchError, setFetchError]       = useState(null);
   const intervalRef                       = useRef(null);
 
@@ -120,7 +118,9 @@ export default function Dashboard() {
       if (eventsRes.status === 'fulfilled') {
         const evData = eventsRes.value;
         const evList = Array.isArray(evData) ? evData : (evData?.events ?? []);
+        const total = typeof evData?.total_stored === 'number' ? evData.total_stored : evList.length;
         setTrafficEvents(evList);
+        setTrafficTotal(total);
       }
 
       if (predRes.status === 'fulfilled' || eventsRes.status === 'fulfilled') {
@@ -150,7 +150,7 @@ export default function Dashboard() {
     tableData,
     hasML,
     hasHTTP,
-  } = buildDashboardData(predictions, trafficEvents);
+  } = buildDashboardData(predictions, trafficEvents, trafficTotal);
 
   const waitingMsg = 'Waiting for live traffic...';
 
