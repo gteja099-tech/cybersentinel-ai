@@ -1,4 +1,4 @@
-const API_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
+const API_URL = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_URL) || 'http://127.0.0.1:8000';
 
 /**
  * Upload a CSV file to the backend for traffic analysis.
@@ -108,4 +108,31 @@ export async function getTrafficEvents(limit = 50) {
     throw err;
   }
 }
+
+export const EXCLUDED_TRAFFIC_PREFIXES = [
+  '/api/live-predictions',
+  '/api/recent-predictions',
+  '/api/traffic-events',
+  '/api/request-log',
+  '/api/capture-status',
+  '/api/flow-features',
+  '/api/feature-columns',
+  '/api/ingest-flow',
+  '/health',
+  '/predict-csv',
+  '/predict',
+];
+
+export function isGenuineTrafficEvent(event) {
+  if (!event || !event.path) return false;
+  const rawPath = String(event.path).trim();
+  if (!rawPath) return false;
+  const cleanPath = rawPath.split('?')[0].trim().toLowerCase();
+  const normalized = cleanPath.startsWith('/') ? cleanPath : `/${cleanPath}`;
+  const withoutTrailing = normalized === '/' ? '/' : normalized.replace(/\/+$/, '');
+  return !EXCLUDED_TRAFFIC_PREFIXES.some(
+    (prefix) => withoutTrailing === prefix || withoutTrailing.startsWith(`${prefix}/`)
+  );
+}
+
 

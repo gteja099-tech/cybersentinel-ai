@@ -433,6 +433,46 @@ def _normalize_event(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Internal API endpoints and dashboard polling paths that must be excluded
+# from the external live traffic counter and live traffic feed.
+EXCLUDED_TRAFFIC_PREFIXES = (
+    "/api/live-predictions",
+    "/api/recent-predictions",
+    "/api/traffic-events",
+    "/api/request-log",
+    "/api/capture-status",
+    "/api/flow-features",
+    "/api/feature-columns",
+    "/api/ingest-flow",
+    "/health",
+    "/predict-csv",
+    "/predict",
+)
+
+
+def is_internal_or_polling_event(event: dict[str, Any]) -> bool:
+    """
+    Returns True if an HTTP event is an internal API request, dashboard polling request,
+    or health check that should be excluded from live traffic metrics.
+    """
+    raw_path = str(event.get("path") or "").strip()
+    if not raw_path:
+        return True
+
+    # Strip query string, normalize casing and trailing slash
+    clean_path = raw_path.split("?")[0].strip().lower()
+    if clean_path != "/":
+        clean_path = clean_path.rstrip("/")
+    if not clean_path.startswith("/"):
+        clean_path = "/" + clean_path
+
+    for prefix in EXCLUDED_TRAFFIC_PREFIXES:
+        if clean_path == prefix or clean_path.startswith(prefix + "/"):
+            return True
+
+    return False
+
+
 @app.post("/api/traffic-events", tags=["Traffic Events"])
 async def ingest_traffic_event(request: Request):
     """
@@ -440,6 +480,7 @@ async def ingest_traffic_event(request: Request):
     id, timestamp, method, path, query, client_ip, user_agent, status_code, response_time_ms.
     Stores the event in thread-safe in-memory deque (last 500 events).
     Supports single JSON object or a JSON array of events.
+    Excludes internal API requests and dashboard polling requests.
     """
     try:
         data = await request.json()
@@ -448,15 +489,31 @@ async def ingest_traffic_event(request: Request):
 
     if isinstance(data, list):
         added = []
+        ignored = 0
         for item in data:
             if isinstance(item, dict):
                 evt = _normalize_event(item)
-                TRAFFIC_EVENTS.append(evt)
-                added.append(evt["id"])
-        logger.info(f"Recorded batch of {len(added)} HTTP traffic events")
-        return JSONResponse(content={"status": "ok", "message": f"{len(added)} events recorded", "ids": added})
+                if not is_internal_or_polling_event(evt):
+                    TRAFFIC_EVENTS.append(evt)
+                    added.append(evt["id"])
+                else:
+                    ignored += 1
+        logger.info(f"Recorded batch: {len(added)} external events recorded, {ignored} internal polling events ignored")
+        return JSONResponse(content={
+            "status": "ok",
+            "message": f"{len(added)} events recorded ({ignored} polling events excluded)",
+            "ids": added,
+        })
     elif isinstance(data, dict):
         evt = _normalize_event(data)
+        if is_internal_or_polling_event(evt):
+            logger.debug(f"Excluded internal polling event: {evt['method']} {evt['path']}")
+            return JSONResponse(content={
+                "status": "ok",
+                "message": "Event excluded (internal polling)",
+                "id": evt["id"],
+                "excluded": True,
+            })
         TRAFFIC_EVENTS.append(evt)
         logger.info(
             f"HTTP Traffic Event: {evt['method']} {evt['path']} "
@@ -471,7 +528,8 @@ async def ingest_traffic_event(request: Request):
 async def get_traffic_events(limit: int = 50):
     """
     Returns the most recent HTTP traffic events stored in memory.
-    If the store is empty, attempts to populate from NovaTech backend if configured.
+    If the store is empty, attempts to populate from NovaTech backend if configured,
+    filtering out internal polling requests.
     """
     limit = max(1, min(limit, 500))
 
@@ -486,16 +544,18 @@ async def get_traffic_events(limit: int = 50):
                     for item in entries:
                         if isinstance(item, dict):
                             evt = _normalize_event(item)
-                            if not any(e.get("id") == evt["id"] for e in TRAFFIC_EVENTS):
-                                TRAFFIC_EVENTS.append(evt)
+                            if not is_internal_or_polling_event(evt):
+                                if not any(e.get("id") == evt["id"] for e in TRAFFIC_EVENTS):
+                                    TRAFFIC_EVENTS.append(evt)
         except Exception as exc:
             logger.debug(f"Could not backfill traffic events from NovaTech: {exc}")
 
-    events = list(TRAFFIC_EVENTS)[-limit:]
+    valid_events = [e for e in TRAFFIC_EVENTS if not is_internal_or_polling_event(e)]
+    events = valid_events[-limit:]
     # Return newest events first for clean display in the live table
     events.reverse()
     return JSONResponse(content={
-        "total_stored": len(TRAFFIC_EVENTS),
+        "total_stored": len(valid_events),
         "returned": len(events),
         "events": events,
     })

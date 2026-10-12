@@ -4,7 +4,7 @@ import Header from '../components/Header';
 import StatCard from '../components/StatCard';
 import AttackTable from '../components/AttackTable';
 import { AttackDistributionPieChart } from '../components/Charts';
-import { getRecentPredictions, getTrafficEvents } from '../services/api';
+import { getRecentPredictions, getTrafficEvents, isGenuineTrafficEvent } from '../services/api';
 import './Page.css';
 
 const COLORS = [
@@ -117,9 +117,13 @@ export default function Dashboard() {
 
       if (eventsRes.status === 'fulfilled') {
         const evData = eventsRes.value;
-        const evList = Array.isArray(evData) ? evData : (evData?.events ?? []);
-        const total = typeof evData?.total_stored === 'number' ? evData.total_stored : evList.length;
-        setTrafficEvents(evList);
+        const rawList = Array.isArray(evData) ? evData : (evData?.events ?? []);
+        const genuineList = rawList.filter(isGenuineTrafficEvent);
+        const total =
+          typeof evData?.total_stored === 'number' && rawList.length === genuineList.length
+            ? evData.total_stored
+            : genuineList.length;
+        setTrafficEvents(genuineList);
         setTrafficTotal(total);
       }
 
