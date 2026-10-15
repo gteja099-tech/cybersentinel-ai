@@ -69,3 +69,9 @@ The three `.pkl` files are **not tracked in git** (they are in `.gitignore`).
 | `feature_columns.pkl` | List of 78 training feature names |
 
 To deploy on Render, upload the `.pkl` files using **Render Disks** or commit them directly if their size allows (scikit-learn models are typically < 100 MB).
+
+
+
+1. CyberSentinel AI: https://cybersentinel-frontend-hm4w.onrender.com
+2. Testing Website (NovaTech): https://novatech-backend-hih9.onrender.com
+
